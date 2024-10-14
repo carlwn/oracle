@@ -17,7 +17,9 @@ def __():
         '<p align="center"><b>Observation, Research, and Analysis of Collapse and Loading Experiments</b></p>'
         '<p align="center">Implementation of closed-form analytical models for the analysis of anticracks in the avalanche release process.</p>'
     )
-    return mo,
+
+    app = mo.App()
+    return app, mo
 
 
 @app.cell
@@ -141,15 +143,16 @@ def __(mo):
 
 
 @app.cell
-def __(mo, run):
-    if run:
-        # 3D list of layer densities, thicknesses and hand hardness. Columns are density (kg/m^3), thickness (mm) and hand_hardness (N/A).
-        layers = []
+def __(mo):
+    # NEW: Removed if run: statement as it is uneccessary
 
-        grain_list = []
+    # 3D list of layer densities, thicknesses and hand hardness. Columns are density (kg/m^3), thickness (mm) and hand_hardness (N/A).
+    layers = []
 
-        # Global button ensuring updating of dynamic table and plot of snow stratification
-        b_update_table_plot = mo.ui.run_button(label="Update table and plot")
+    grain_list = []
+
+    # Global button ensuring updating of dynamic table and plot of snow stratification
+    b_update_table_plot = mo.ui.run_button(label="Update table and plot")
     return b_update_table_plot, grain_list, layers
 
 
@@ -230,35 +233,36 @@ def __(
 ):
     if b_addlayer.value or b_resetlayers.value or b_update_table_plot.value:
 
+
         # Creating the table
         updated_thickness = mo.ui.array(
                 mo.ui.number(value=int(layer[1]), start=1, stop=1000, step=1,
                             on_change=lambda value, i=i: update_thickness(i, value))
-                for i, layer in enumerate(layers)
+                for i, layer in enumerate(reversed(layers))
         )
 
         updated_grainform = mo.ui.array(
                 mo.ui.dropdown(options=opt_grainform, value=grainform,
                               on_change=lambda value, i=i: update_grainform(i, value))
-                for i, grainform in enumerate(grain_list)
+                for i, grainform in enumerate(reversed(grain_list))
         )
 
         updated_hand_hardness = mo.ui.array(
                 mo.ui.number(value=int(layer[2]), start=1, stop=5, step=1,
                             on_change=lambda value, i=i: update_hand_hardness(i, value)
                             )
-                for i, layer in enumerate(layers)
+                for i, layer in enumerate(reversed(layers))
         )
 
         remove_buttons = mo.ui.array(
-                        mo.ui.run_button(label=f"Remove layer {i+1}",
+                        mo.ui.run_button(label=f"Remove layer {len(layers)-i}",
                                         on_change=lambda value, i=i: deleting_layers(i))
-                        for i, layer in enumerate(layers)
+                        for i, layer in enumerate(reversed(layers))
         )
 
         table = mo.hstack(
             [
-                mo.vstack( ["Thickness (mm)", updated_thickness] ),
+                mo.vstack( ["Thickness (mm)", updated_thickness]),
                 mo.vstack( ["Grain form", updated_grainform] ), 
                 mo.vstack( ["Hand hardness", updated_hand_hardness] ),
                 mo.vstack( ["Remove layers", remove_buttons] )
@@ -403,6 +407,14 @@ def __(grain_list, layers):
         layers.pop(index)
         grain_list.pop(index)
     return deleting_layers,
+
+
+@app.cell
+def fetch_snow_profile_test(grain_list, layers):
+    def fetch_snow_profile_function():
+
+        return layers, grain_list
+    return fetch_snow_profile_function,
 
 
 if __name__ == "__main__":
