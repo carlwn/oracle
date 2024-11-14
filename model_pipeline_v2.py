@@ -5,15 +5,804 @@ app = marimo.App(width="medium")
 
 
 @app.cell
+def __(ast, check_first_criterion_v2):
+    # Function to apply for extracting skier_weight and crack_length
+    def apply_check_first_criterion(row):
+
+        inclination = row['slopeangle']
+        # skier_weight = row['approximate_critical_loads']
+        snow_profile = ast.literal_eval(row['snow_profiles'])
+
+        # REMEMBER THAT WE NEED TO REVERSE
+
+        # print(snow_profile)
+
+        snow_profile_reversed = snow_profile[::-1]
+
+        print(snow_profile_reversed)
+
+        convergence_check, crack_length, skier_weight, _, _, _, _, _, _, iterations, elapsed_times, skier_weights, crack_lengths = check_first_criterion_v2(
+            snow_profile=snow_profile_reversed, inclination=inclination, skier_weight=1000, envelope='no_cap'
+        )
+
+        if convergence_check:
+            print(f"\033[91m CONVERGENCE: WE FOUND A SOLUTION AND WILL NOW LOOK AT THE NEXT DATA POINT \033[0m")
+        else:
+            print(f"\033[91m ALGORITHM DID NOT CONVERGE \033[0m")
+
+        return convergence_check, skier_weight, crack_length, iterations, elapsed_times, skier_weights, crack_lengths
+    return apply_check_first_criterion,
+
+
+@app.cell
+def __(
+    check_first_criterion_damped,
+    check_first_criterion_damped_outside_envelope,
+    create_skier_object_v2,
+    energy_criterion,
+    find_minimum_force_v2,
+    find_new_crack_length_v2,
+    is_outside_stress_envelope,
+    np,
+    time,
+):
+    def check_first_criterion_v2(snow_profile, inclination, skier_weight, envelope='reiweger'):
+        # Assuming nocrack case to begin with and create a skier-object
+        crack_length = 0
+        length = 100 * (sum(layer[1] for layer in snow_profile))  # Total length (mm)
+        # length = 100 * 100 * 10  # Total length (mm) (one hundred meters in mm)
+        # length = 100 * (sum(layer[1] for layer in snow_profile)) 
+        # length = sum(li)
+
+        k0 = [True, True, True, True]  # Support boolean for uncracked solution
+        li = [length / 2, 0, 0, length / 2]  # Support boolean for uncracked solution
+        ki = [True, True, True, True]  # Length of segments with foundations as specified by ki
+
+        skier, C, segments, x_cm, sigma_kPa, tau_kPa = create_skier_object_v2(snow_profile, crack_length, skier_weight, inclination, li, ki, crack_case='nocrack')
+
+        # For the initial skier object, check if we are outside the stress envelope at any point
+        checker, dist_to_failure = is_outside_stress_envelope(sigma_kPa, -tau_kPa, envelope=envelope)
+
+        # Time tracker
+        start_time = time.time()
+        elapsed_times = []
+
+        # Tracker lists for skier weights and crack lengths
+        skier_weights = []
+        crack_lengths = []
+
+
+        # Initialize iteration variables
+        iteration_count = 0
+        max_iterations = 25
+
+        if checker.any() and not checker.all():
+            # Find the weight associated with minimum critical force to initialize our algorithm (BASE CASE)
+            skier_weight, *_ = find_minimum_force_v2(snow_profile, inclination, li, ki, envelope=envelope) 
+
+            initial_skier_weight = skier_weight
+            
+            # Initialize variables for algorithm
+            init_crack_length = 1  # Initial crack length
+            err = 1000  # Error margin
+            li = [length / 2 - init_crack_length / 2, init_crack_length / 2, init_crack_length / 2, length / 2 - init_crack_length / 2]
+            ki = [True, False, False, True]
+
+            
+            while np.abs(err) > 0.002 and iteration_count < max_iterations and any(ki):
+                # ki.any() ensures we move out in case we are outside the envelope in all points
+
+                # Increment iteration counter
+                iteration_count += 1
+
+
+                # Track skier weight and crack length for each iteration
+                skier_weights.append(skier_weight)
+                crack_lengths.append(crack_length)
+
+                # Time tracking for each iteration
+                elapsed_times.append(time.time() - start_time)
+
+                # Create the base_case with correct number of segments
+                skier, C, segments, x_cm, sigma_kPa, tau_kPa = create_skier_object_v2(snow_profile, crack_length, skier_weight, inclination, li, ki, crack_case='nocrack')
+
+                # Solving a cracked solution
+                c_skier, c_C, c_segments, c_x_cm, c_sigma_kPa, c_tau_kPa = create_skier_object_v2(snow_profile, crack_length, skier_weight, inclination, li, ki, crack_case='crack')
+
+                # print(f" Solution: {c_segments}")
+
+                # Section to keep track of distance to failure
+                checker_2, dist_to_failure_2 = is_outside_stress_envelope(sigma_kPa, -tau_kPa, envelope=envelope)
+                # WHY IS THIS NOT THE SAME DISTANCE TO FAILURE AS THE LAST ONE IN find_min_force
+
+                print(f" START OF ITERATION {iteration_count}: cracklength: {crack_length} mm, Skier Weight: {skier_weight} kg, Max Distance to Failure: {np.max(dist_to_failure_2)}")
+
+
+                # The uncracked solution will have True for all values
+                k0 = np.full(len(ki), True)
+
+                # Calculate incremental energy released compared to (BASE CASE) solution above
+                incr_energy = c_skier.ginc(C0=C, C1=c_C, phi=inclination, **c_segments, k0=k0)
+
+                # Evaluate energy envelope (scaling by 1000 to convert kJ to J)
+                g_delta = energy_criterion(1000 * incr_energy[1], 1000 * incr_energy[2])
+
+                scaling = (g_delta**(-1/12))
+                
+                # For any scaling below 1, we are not outside the energy envelope and must increase the force
+                current_normal_force, current_tangential_force = c_skier.get_skier_load(skier_weight, inclination)
+                current_gravitational_force = np.sqrt(current_normal_force ** 2 + current_tangential_force ** 2)
+                updated_gravitational_force = scaling * (current_gravitational_force)
+
+                
+                
+                # Updating error margin
+                err = np.abs(updated_gravitational_force - current_gravitational_force) / updated_gravitational_force
+
+                # For errors > margin we scale skier weight according to g_delta calculated above, and find new crack length
+                if np.abs(err) > 0.002:
+                    new_skier_weight = skier_weight * scaling
+
+                    # For the updated skier force, we find all points where the weak layer is overloaded and use this as 
+
+                    # the crack length in the next iteration (with li and ki specifying how the crack is positioned in the weak layer)
+
+                    new_crack_length, li, ki = find_new_crack_length_v2(snow_profile, skier_weight, inclination, li, ki, envelope=envelope)
+                    crack_length = new_crack_length
+                    print(f" END OF ITERATION: g_delta: {g_delta} J/m^2, Old skier weight: {skier_weight} kg, Scaling: {scaling} kg, New skier weight: {new_skier_weight} kg, cracklength: {crack_length} mm,")
+
+                    skier_weight = new_skier_weight
+
+            # End of loop, i.e., convergence or max iteration reached
+            if iteration_count < max_iterations and any(ki):
+                print(f" CONVERGENCE: cracklength: {crack_length} mm, Critical Skier Weight: {skier_weight} kg, Distance to energy envelope: {g_delta} J/m^2, Max Distance to Stress Envelope: {np.max(dist_to_failure_2)}")
+                
+                if crack_length>0:
+                    return True, crack_length, skier_weight, c_skier, c_C, c_segments, c_x_cm, c_sigma_kPa, c_tau_kPa, iteration_count, elapsed_times, skier_weights, crack_lengths
+                else:
+                    print(f" Cracklength is zero and we redo the algorithm with the dampened version")
+                    skier_weight_average = np.average(skier_weights)
+                    variance = np.var(np.asarray(skier_weights), ddof=1)
+                    
+                    return check_first_criterion_damped_outside_envelope(snow_profile, inclination, skier_weight_average, variance, envelope=envelope)
+            
+            
+            elif not any(ki):
+                print("We are outside the envelope in all points")
+                return True, crack_length, skier_weight, None, None, None, None, None, None, iteration_count, elapsed_times, skier_weights, crack_lengths
+            else:
+                # The issue of non-convergence is often bouncing too far above and too far below the solution. If we take the average of the approxima
+                
+                print("Maximum iterations reached without convergence.")
+                skier_weight_average = np.average(skier_weights)
+
+                variance = np.var(np.asarray(skier_weights), ddof=1)
+
+
+                return check_first_criterion_damped(snow_profile, inclination, skier_weight_average, variance, envelope=envelope)
+
+        elif checker.all():
+            # Extreme case (i) we are outside the boundary at all points: the entire solution is cracked
+            crack_length = length
+            skier_weight = 0
+
+            return True, crack_length, skier_weight, None, None, None, None, None, None, iteration_count, elapsed_times, skier_weights, crack_lengths
+
+        else:
+            # Extreme case (ii) We do not fulfill the stress criterion in any point, and will therefore not be able to trigger an avalanche
+            return False, 0, skier_weight, None, None, None, None, None, None, iteration_count, elapsed_times, skier_weights, crack_lengths
+    return check_first_criterion_v2,
+
+
+@app.cell
+def __(
+    create_skier_object_v2,
+    energy_criterion,
+    find_minimum_force_v2,
+    find_new_crack_length_v2,
+    is_outside_stress_envelope,
+    np,
+    time,
+):
+    # This method is specifically used in instances when the original algorithm converges, but with a crack_length of zero
+
+    def check_first_criterion_damped_outside_envelope(snow_profile, inclination, skier_weight, variance, envelope='reiweger'):
+        
+        # We use the variance to determine a suitable coefficient to scale
+        standardized_std = np.sqrt(variance)/skier_weight*100
+                                  
+        print(f" STANDARDIZED STD: {standardized_std}")
+        # Assuming nocrack case to begin with and create a skier-object
+        crack_length = 0
+        length = 100 * (sum(layer[1] for layer in snow_profile))  # Total length (mm)
+        # length = 100 * 100 * 10  # Total length (mm) (one hundred meters in mm)
+        # length = 100 * (sum(layer[1] for layer in snow_profile)) 
+        # length = sum(li)
+
+        k0 = [True, True, True, True]  # Support boolean for uncracked solution
+        li = [length / 2, 0, 0, length / 2]  # Support boolean for uncracked solution
+        ki = [True, True, True, True]  # Length of segments with foundations as specified by ki
+
+        skier, C, segments, x_cm, sigma_kPa, tau_kPa = create_skier_object_v2(snow_profile, crack_length, skier_weight, inclination, li, ki, crack_case='nocrack')
+
+        # For the initial skier object, check if we are outside the stress envelope at any point
+        checker, dist_to_failure = is_outside_stress_envelope(sigma_kPa, -tau_kPa, envelope=envelope)
+
+        # Time tracker
+        start_time = time.time()
+        elapsed_times = []
+
+        # Tracker lists for skier weights and crack lengths
+        skier_weights = []
+        crack_lengths = []
+
+        # Initialize iteration variables
+        iteration_count = 0
+        max_iterations = 40
+
+        if checker.any() and not checker.all():
+            # Find the weight associated with minimum critical force to initialize our algorithm (BASE CASE)
+            skier_weight, *_ = find_minimum_force_v2(snow_profile, inclination, li, ki, envelope=envelope) 
+
+            # Initialize variables for algorithm
+            init_crack_length = 1  # Initial crack length
+            err = 1000  # Error margin
+            li = [length / 2 - init_crack_length / 2, init_crack_length / 2, init_crack_length / 2, length / 2 - init_crack_length / 2]
+            ki = [True, False, False, True]
+
+            
+
+
+
+            while np.abs(err) > 0.001 and iteration_count < max_iterations and any(ki):
+                # ki.any() ensures we move out in case we are outside the envelope in all points
+
+                # Increment iteration counter
+                iteration_count += 1
+
+
+                # Track skier weight and crack length for each iteration
+                skier_weights.append(skier_weight)
+                crack_lengths.append(crack_length)
+
+                # Time tracking for each iteration
+                elapsed_times.append(time.time() - start_time)
+
+                # Create the base_case with correct number of segments
+                skier, C, segments, x_cm, sigma_kPa, tau_kPa = create_skier_object_v2(snow_profile, crack_length, skier_weight, inclination, li, ki, crack_case='nocrack')
+
+                # Solving a cracked solution
+                c_skier, c_C, c_segments, c_x_cm, c_sigma_kPa, c_tau_kPa = create_skier_object_v2(snow_profile, crack_length, skier_weight, inclination, li, ki, crack_case='crack')
+
+                # print(f" Solution: {c_segments}")
+
+                # Section to keep track of distance to failure
+                checker_2, dist_to_failure_2 = is_outside_stress_envelope(sigma_kPa, -tau_kPa, envelope=envelope)
+                # WHY IS THIS NOT THE SAME DISTANCE TO FAILURE AS THE LAST ONE IN find_min_force
+
+                print(f" START OF ITERATION {iteration_count}: cracklength: {crack_length} mm, Skier Weight: {skier_weight} kg, Max Distance to Failure: {np.max(dist_to_failure_2)}")
+
+
+                # The uncracked solution will have True for all values
+                k0 = np.full(len(ki), True)
+
+                # Calculate incremental energy released compared to (BASE CASE) solution above
+                incr_energy = c_skier.ginc(C0=C, C1=c_C, phi=inclination, **c_segments, k0=k0)
+
+                # Evaluate energy envelope (scaling by 1000 to convert kJ to J)
+                g_delta = energy_criterion(1000 * incr_energy[1], 1000 * incr_energy[2])
+
+
+                scaling = (g_delta**(-1/10))
+
+
+                # We weight scaling to dampen the behavior
+                # Greater standard deviations put more emphasis on dampening
+                
+                scaling = (standardized_std+scaling)/(standardized_std+1)
+               
+                
+                # For any g_delta below 1, we are not outside the energy envelope and must increase the force
+                current_normal_force, current_tangential_force = c_skier.get_skier_load(skier_weight, inclination)
+                current_gravitational_force = np.sqrt(current_normal_force ** 2 + current_tangential_force ** 2)
+                updated_gravitational_force = scaling * (current_gravitational_force)
+
+                
+
+                
+
+                # We have now dampened the behavior
+
+                # Updating error margin
+                err = np.abs(updated_gravitational_force - current_gravitational_force) / updated_gravitational_force
+
+                # For errors > margin we scale skier weight according to g_delta calculated above, and find new crack length
+                if np.abs(err) > 0.001:
+                    new_skier_weight = skier_weight * scaling
+
+                    # For the updated skier force, we find all points where the weak layer is overloaded and use this as 
+
+                    # the crack length in the next iteration (with li and ki specifying how the crack is positioned in the weak layer)
+
+                    new_crack_length, li, ki = find_new_crack_length_v2(snow_profile, skier_weight, inclination, li, ki, envelope=envelope)
+                    crack_length = new_crack_length
+                    print(f" END OF ITERATION: g_delta: {g_delta} J/m^2, Old skier weight: {skier_weight} kg, Scaling: {scaling} kg, New skier weight: {new_skier_weight} kg, cracklength: {crack_length} mm,")
+
+                    skier_weight = new_skier_weight
+
+            # End of loop, i.e., convergence or max iteration reached
+            if iteration_count < max_iterations and any(ki):
+                print(f" CONVERGENCE: cracklength: {crack_length} mm, Critical Skier Weight: {skier_weight} kg, Distance to energy envelope: {g_delta} J/m^2, Max Distance to Stress Envelope: {np.max(dist_to_failure_2)}")
+                return True, crack_length, skier_weight, c_skier, c_C, c_segments, c_x_cm, c_sigma_kPa, c_tau_kPa, iteration_count, elapsed_times, skier_weights, crack_lengths
+            elif not any(ki):
+                print("We are outside the envelope in all points")
+                return True, crack_length, skier_weight, None, None, None, None, None, None, iteration_count, elapsed_times, skier_weights, crack_lengths
+            else:
+                # The issue of non-convergence is often bouncing too far above and too far below the solution. If we take the average of the approxima
+
+                print("Maximum iterations reached without convergence.")
+                skier_weight = np.average(skier_weights)
+
+                return False, crack_length, skier_weight, None, None, None, None, None, None, iteration_count, elapsed_times, skier_weights, crack_lengths
+
+        elif checker.all():
+            # Extreme case (i) we are outside the boundary at all points
+            crack_length = length
+            skier_weight = 0
+
+            # Elapsed time is zero
+
+            return True, crack_length, skier_weight, None, None, None, None, None, None, iteration_count, elapsed_times, skier_weights, crack_lengths
+
+        else:
+            # Extreme case (ii) We do not fulfill the stress criterion in any point, and will therefore not be able to trigger an avalanche
+            return False, 0, skier_weight, None, None, None, None, None, None, iteration_count, elapsed_times, skier_weights, crack_lengths
+    return check_first_criterion_damped_outside_envelope,
+
+
+@app.cell
+def __(
+    create_skier_object_v2,
+    energy_criterion,
+    find_minimum_force_v2,
+    find_new_crack_length_v2,
+    is_outside_stress_envelope,
+    np,
+    time,
+):
+    # This method is specifically used in instances when the original algorithm will not converge, as we bounce between solutions 
+
+    def check_first_criterion_damped(snow_profile, inclination, skier_weight, variance, envelope='reiweger'):
+        
+        # We use the variance to determine a suitable coefficient to scale
+        standardized_std = np.sqrt(variance)/skier_weight*100
+                                  
+        print(f" STANDARDIZED STD: {standardized_std}")
+        # Assuming nocrack case to begin with and create a skier-object
+        crack_length = 0
+        length = 100 * (sum(layer[1] for layer in snow_profile))  # Total length (mm)
+        # length = 100 * 100 * 10  # Total length (mm) (one hundred meters in mm)
+        # length = 100 * (sum(layer[1] for layer in snow_profile)) 
+        # length = sum(li)
+
+        k0 = [True, True, True, True]  # Support boolean for uncracked solution
+        li = [length / 2, 0, 0, length / 2]  # Support boolean for uncracked solution
+        ki = [True, True, True, True]  # Length of segments with foundations as specified by ki
+
+        skier, C, segments, x_cm, sigma_kPa, tau_kPa = create_skier_object_v2(snow_profile, crack_length, skier_weight, inclination, li, ki, crack_case='nocrack')
+
+        # For the initial skier object, check if we are outside the stress envelope at any point
+        checker, dist_to_failure = is_outside_stress_envelope(sigma_kPa, -tau_kPa, envelope=envelope)
+
+        # Time tracker
+        start_time = time.time()
+        elapsed_times = []
+
+        # Tracker lists for skier weights and crack lengths
+        skier_weights = []
+        crack_lengths = []
+
+        # Initialize iteration variables
+        iteration_count = 0
+        max_iterations = 40
+
+        if checker.any() and not checker.all():
+            # Find the weight associated with minimum critical force to initialize our algorithm (BASE CASE)
+            skier_weight, *_ = find_minimum_force_v2(snow_profile, inclination, li, ki, envelope=envelope) 
+
+            # Initialize variables for algorithm
+            init_crack_length = 1  # Initial crack length
+            err = 1000  # Error margin
+            li = [length / 2 - init_crack_length / 2, init_crack_length / 2, init_crack_length / 2, length / 2 - init_crack_length / 2]
+            ki = [True, False, False, True]
+
+            
+
+
+
+            while np.abs(err) > 0.001 and iteration_count < max_iterations and any(ki):
+                # ki.any() ensures we move out in case we are outside the envelope in all points
+
+                # Increment iteration counter
+                iteration_count += 1
+
+
+                # Track skier weight and crack length for each iteration
+                skier_weights.append(skier_weight)
+                crack_lengths.append(crack_length)
+
+                # Time tracking for each iteration
+                elapsed_times.append(time.time() - start_time)
+
+                # Create the base_case with correct number of segments
+                skier, C, segments, x_cm, sigma_kPa, tau_kPa = create_skier_object_v2(snow_profile, crack_length, skier_weight, inclination, li, ki, crack_case='nocrack')
+
+                # Solving a cracked solution
+                c_skier, c_C, c_segments, c_x_cm, c_sigma_kPa, c_tau_kPa = create_skier_object_v2(snow_profile, crack_length, skier_weight, inclination, li, ki, crack_case='crack')
+
+                # print(f" Solution: {c_segments}")
+
+                # Section to keep track of distance to failure
+                checker_2, dist_to_failure_2 = is_outside_stress_envelope(sigma_kPa, -tau_kPa, envelope=envelope)
+                # WHY IS THIS NOT THE SAME DISTANCE TO FAILURE AS THE LAST ONE IN find_min_force
+
+                print(f" START OF ITERATION {iteration_count}: cracklength: {crack_length} mm, Skier Weight: {skier_weight} kg, Max Distance to Failure: {np.max(dist_to_failure_2)}")
+
+
+                # The uncracked solution will have True for all values
+                k0 = np.full(len(ki), True)
+
+                # Calculate incremental energy released compared to (BASE CASE) solution above
+                incr_energy = c_skier.ginc(C0=C, C1=c_C, phi=inclination, **c_segments, k0=k0)
+
+                # Evaluate energy envelope (scaling by 1000 to convert kJ to J)
+                g_delta = energy_criterion(1000 * incr_energy[1], 1000 * incr_energy[2])
+
+
+                scaling = (g_delta**(-1/10))
+
+
+                # We weight scaling to dampen the behavior
+                # Greater standard deviations put more emphasis on dampening
+                
+                scaling = (standardized_std+scaling)/(standardized_std+1)
+               
+                
+                # For any g_delta below 1, we are not outside the energy envelope and must increase the force
+                current_normal_force, current_tangential_force = c_skier.get_skier_load(skier_weight, inclination)
+                current_gravitational_force = np.sqrt(current_normal_force ** 2 + current_tangential_force ** 2)
+                updated_gravitational_force = scaling * (current_gravitational_force)
+
+                
+
+                
+
+                # We have now dampened the behavior
+
+                # Updating error margin
+                err = np.abs(updated_gravitational_force - current_gravitational_force) / updated_gravitational_force
+
+                # For errors > margin we scale skier weight according to g_delta calculated above, and find new crack length
+                if np.abs(err) > 0.001:
+                    new_skier_weight = skier_weight * scaling
+
+                    # For the updated skier force, we find all points where the weak layer is overloaded and use this as 
+
+                    # the crack length in the next iteration (with li and ki specifying how the crack is positioned in the weak layer)
+
+                    new_crack_length, li, ki = find_new_crack_length_v2(snow_profile, skier_weight, inclination, li, ki, envelope=envelope)
+                    crack_length = new_crack_length
+                    print(f" END OF ITERATION: g_delta: {g_delta} J/m^2, Old skier weight: {skier_weight} kg, Scaling: {scaling} kg, New skier weight: {new_skier_weight} kg, cracklength: {crack_length} mm,")
+
+                    skier_weight = new_skier_weight
+
+            # End of loop, i.e., convergence or max iteration reached
+            if iteration_count < max_iterations and any(ki):
+                print(f" CONVERGENCE: cracklength: {crack_length} mm, Critical Skier Weight: {skier_weight} kg, Distance to energy envelope: {g_delta} J/m^2, Max Distance to Stress Envelope: {np.max(dist_to_failure_2)}")
+                return True, crack_length, skier_weight, c_skier, c_C, c_segments, c_x_cm, c_sigma_kPa, c_tau_kPa, iteration_count, elapsed_times, skier_weights, crack_lengths
+            elif not any(ki):
+                print("We are outside the envelope in all points")
+                return True, crack_length, skier_weight, None, None, None, None, None, None, iteration_count, elapsed_times, skier_weights, crack_lengths
+            else:
+                # The issue of non-convergence is often bouncing too far above and too far below the solution. If we take the average of the approxima
+
+                print("Maximum iterations reached without convergence.")
+                skier_weight = np.average(skier_weights)
+
+                return False, crack_length, skier_weight, None, None, None, None, None, None, iteration_count, elapsed_times, skier_weights, crack_lengths
+
+        elif checker.all():
+            # Extreme case (i) we are outside the boundary at all points
+            crack_length = length
+            skier_weight = 0
+
+            # Elapsed time is zero
+
+            return True, crack_length, skier_weight, None, None, None, None, None, None, iteration_count, elapsed_times, skier_weights, crack_lengths
+
+        else:
+            # Extreme case (ii) We do not fulfill the stress criterion in any point, and will therefore not be able to trigger an avalanche
+            return False, 0, skier_weight, None, None, None, None, None, None, iteration_count, elapsed_times, skier_weights, crack_lengths
+    return check_first_criterion_damped,
+
+
+@app.cell
+def __(create_skier_object_v2, is_outside_stress_envelope, np):
+    def find_new_crack_length_v2(snow_profile, skier_weight_z, inclination, li, ki, envelope='reiweger'):
+
+        # This version assumes a full-crack from first to last, without the uncracked segment in the middle
+
+
+        crack_length = 0
+
+        print("INSIDE FIND NEW CRACK LENGTH METHOD")
+        skier, C, segments, x_cm, sigma_kPa, tau_kPa = create_skier_object_v2(
+            snow_profile, crack_length, skier_weight_z, inclination, li, ki, crack_case='nocrack') 
+
+        # Check if we are outside the stress envelope
+
+        checker, dist_to_failure = is_outside_stress_envelope(sigma_kPa, -tau_kPa, envelope=envelope) 
+
+        # Flattening arrays
+        x_cm_array = np.array(10*x_cm).flatten()
+        dist_to_fail_array = np.array(dist_to_failure).flatten()
+        checker_array = np.array(checker).flatten()
+
+        print("Distance to Failure Array:", dist_to_fail_array)
+        #print("X cm Array:", x_cm_array)
+
+        # Create a foundation object
+        foundations = ~checker_array
+
+        # Finding switch indices
+        switches = np.where(np.diff(np.sign(dist_to_fail_array - 0.999)))[0]
+        
+        print("Switches Indices:", switches, x_cm[switches+1], dist_to_fail_array[switches+1])
+        #print("Switches Indices:", switches, x_cm[switches+1], dist_to_fail_array[switches+1])
+
+        # This new version just takes the first and last instances
+
+
+
+        # Ensure switches + 1 are within bounds
+        if switches.size > 0:
+
+            start_crack = switches[0]
+            end_crack = switches[-1]
+
+            switches_short = np.array([start_crack, end_crack])
+            print(type(switches_short)) 
+            print(switches_short) 
+
+
+
+            # OLD
+            # ki = [foundations[0]]
+            # ki.extend(foundations[switches + 1])
+
+            # NEW
+            ki = [foundations[0]]
+
+            ki.extend(foundations[switches_short+1])
+            # ki.extend(foundations[switches_short])
+
+            # Constructing segment boundaries
+
+            # OLD
+            # segment_boundaries = [x_cm_array[0]]  # Start with the first point
+            #segment_boundaries.extend(x_cm_array[switches+1])  # Append the points where switches occur
+            #segment_boundaries.append(x_cm_array[-1])  # End with the last point
+
+            # NEW - only two points of interest
+            segment_boundaries = [x_cm_array[0]]  # Start with the first point
+            segment_boundaries.extend(x_cm_array[switches_short+1])
+            #segment_boundaries.extend(x_cm_array[switches_short])  # Append the 
+            segment_boundaries.append(x_cm_array[-1]) # Last point
+
+
+            # Calculate lengths between segment boundaries
+            li = np.diff(segment_boundaries)
+
+            # print("Lengths between segment boundaries (li):", li)
+
+            # Calculate total length of li
+            total_length = np.sum(li)
+            midpoint = total_length / 2
+            #print("Total Length of li:", total_length)
+            #print("Midpoint of Total Length:", midpoint)
+
+            # Locate the segment that brings the cumulative sum to the midpoint
+            cumulative_length = np.cumsum(li)
+            #print("Cumulative Lengths of li:", cumulative_length)
+
+            # Find the index of the segment containing the midpoint
+            segment_index = np.where(cumulative_length >= midpoint)[0][0]  # First segment to exceed midpoint
+            #print("Segment Index at Midpoint:", segment_index)
+
+            # If the segment index is valid, split that segment
+            if segment_index < len(li):
+                segment_start = cumulative_length[segment_index - 1] if segment_index > 0 else 0
+                segment_to_split_length = li[segment_index]
+
+                # Calculate the length to split
+                split_length = midpoint - segment_start
+
+                # Adjust the lengths
+                li = np.insert(li, segment_index, [split_length, segment_to_split_length - split_length])
+                li = np.delete(li, segment_index + 2)  # Remove the original segment that was split
+
+                # Split the ki array accordingly
+                # Duplicate the foundation state of the original segment
+                ki = np.insert(ki, segment_index, ki[segment_index])  # Insert the existing boolean value twice
+                print("New ki after splitting:", ki)
+
+                print("New Lengths after Splitting Segment:", li)
+
+        else:
+            ki = [foundations[0],foundations[0], foundations[-1], foundations[-1]]  # If there are no switches, we are on the same side of the envelope in all points
+
+            # This should mean that we are outside the envelope in all places
+            total_length = np.sum(li)
+            midpoint = total_length / 2
+
+            li = [total_length/2,0,0, total_length/2] # We just make sure to split the segment in half
+
+
+
+        # Calculate new crack length
+        new_crack_length = sum(length for length, foundation in zip(li, ki) if not foundation)
+
+        return new_crack_length, li, ki
+    return find_new_crack_length_v2,
+
+
+@app.cell
+def __():
+    # Conclusion: all three begin outside of the envelope 
+    return
+
+
+@app.cell
+def __():
+    # These four instances do not converge even with the dampened version of the envelope [12590, 13330, 22890, 46110]
+    return
+
+
+@app.cell
+def __(ast, df_100st):
+    # profID # [14990, 44290, 44334]
+
+    df_test = df_100st.loc[df_100st['profID'] == 44334, ['snow_profiles', 'slopeangle']]
+
+    # Assuming df_test is your DataFrame
+    inclination_xx = df_test['slopeangle'].iloc[0]  # Get the first row's slope angle
+    snow_profile_xx = ast.literal_eval(df_test['snow_profiles'].iloc[0])  # Get the first row's snow profile and evaluate it
+
+    # Reverse the snow profile
+    snow_profile_reversed = snow_profile_xx[::-1]
+    return df_test, inclination_xx, snow_profile_reversed, snow_profile_xx
+
+
+@app.cell
+def __(
+    create_skier_object_v2,
+    inclination_xx,
+    is_outside_stress_envelope,
+    snow_profile_reversed,
+    snow_profile_xx,
+):
+    crack_length_xx = 0
+    total_length_xx = 100 * (sum(layer[1] for layer in snow_profile_reversed))  # Total length in mm
+    # total_length_xx = 100 * 100 * 10  # Uncomment if using a fixed length of 100 meters in mm
+
+    support_boolean_xx = [True, True, True, True]  # Support boolean for uncracked solution
+    segment_lengths_xx = [total_length_xx / 2, 0, 0, total_length_xx / 2]  # Support boolean for uncracked solution
+    segment_foundation_xx = [True, True, True, True]  # Length of segments with foundations as specified by segment_foundation
+
+    # Assuming skier_weight_xx and inclination_xx are defined elsewhere in your code
+    skier_obj_xx, C_value_xx, segments_data_xx, x_center_of_mass_xx, sigma_kPa_values_xx, tau_kPa_values_xx = create_skier_object_v2(
+        snow_profile_xx, crack_length_xx, 10, inclination_xx, segment_lengths_xx, segment_foundation_xx, crack_case='nocrack'
+    )
+
+    # Check if we are outside the stress envelope at any point
+    stress_checker_xx, distance_to_failure_xx = is_outside_stress_envelope(sigma_kPa_values_xx, -tau_kPa_values_xx, envelope="no_cap")
+
+
+
+    return (
+        C_value_xx,
+        crack_length_xx,
+        distance_to_failure_xx,
+        segment_foundation_xx,
+        segment_lengths_xx,
+        segments_data_xx,
+        sigma_kPa_values_xx,
+        skier_obj_xx,
+        stress_checker_xx,
+        support_boolean_xx,
+        tau_kPa_values_xx,
+        total_length_xx,
+        x_center_of_mass_xx,
+    )
+
+
+@app.cell
+def __(plt, sigma_kPa_values_xx, tau_kPa_values_xx, x_center_of_mass_xx):
+
+
+    # Assuming that skier_obj_xx, C_value_xx, segments_data_xx, x_center_of_mass_xx, sigma_kPa_values_xx, tau_kPa_values_xx 
+    # have been returned from create_skier_object_v2() as previously defined
+
+    # Create the plot
+    plt.figure(figsize=(10, 6))
+
+    # Plot tau (shear stress) vs x_center_of_mass
+    plt.plot(x_center_of_mass_xx, tau_kPa_values_xx, label=r'$\tau$ (shear stress)', color='r', linestyle='-', marker='o')
+
+    # Plot sigma (normal stress) vs x_center_of_mass
+    plt.plot(x_center_of_mass_xx, sigma_kPa_values_xx, label=r'$\sigma$ (normal stress)', color='b', linestyle='-', marker='x')
+
+    # Adding labels and title
+    plt.xlabel('X (Center of Mass, cm)', fontsize=12)
+    plt.ylabel('Stress (kPa)', fontsize=12)
+    plt.title('Stress vs. Position (Center of Mass)', fontsize=14)
+
+    # Adding grid and legend
+    plt.grid(True)
+    plt.legend()
+
+    # Show the plot
+    plt.tight_layout()
+    plt.show()
+
+    return
+
+
+@app.cell
+def __(
+    failure_envelope_present_no_cap,
+    new_env,
+    plt,
+    sigma_kPa_values_xx,
+    tau_kPa_values_xx,
+):
+    # Create the plot
+    plt.figure(figsize=(10, 6))
+
+    # Plot tau (shear stress) vs x_center_of_mass
+    plt.scatter(sigma_kPa_values_xx, -tau_kPa_values_xx, label=r'$\tau$ (shear stress) vs $\sigma$ (normal stress)', color='r', marker='o')
+
+    plt.plot(new_env, failure_envelope_present_no_cap(new_env), label='No_cap envelope', color='green')
+    plt.fill_between(new_env, failure_envelope_present_no_cap(new_env), color='lightgreen', alpha=0.1)
+
+
+    # Adding labels and title
+    plt.xlabel(r'$\sigma$ (normal stress)', fontsize=12)
+    plt.ylabel(r'$\tau$ (shear stress)', fontsize=12)
+    plt.title('Stress vs. Position (Center of Mass)', fontsize=14)
+
+    # Adding grid and legend
+    plt.grid(True)
+    plt.legend()
+
+    # Show the plot
+    plt.tight_layout()
+    plt.show()
+    return
+
+
+@app.cell
 def __(mo):
     mo.md(
         """
         # Updates
         1. Start a new branch
         2. Crack entire length
-        3. Replace discrete with continuous x_tau
-        4. By Friday: have a new version in place
-        5. Create a cleaned up version
+        3. Use the new Valle-envelope
+        4. Replace discrete with continuous x_tau and root search
+        5. By Friday: have a new version in place
+        6. Create a cleaned up version
+        7. 
 
 
         # Questions / Issues
@@ -102,14 +891,6 @@ def __(df_subset):
     return
 
 
-@app.cell(disabled=True)
-def __(df_subset):
-    df_zero_cracklengths_new = df_subset[df_subset['crack_length'] == 0]
-
-    df_zero_cracklengths_new
-    return df_zero_cracklengths_new,
-
-
 @app.cell
 def __():
     # ALL OF THESE ABOVE ARE FOR WHEN YOU RERUN THE SCRIPT
@@ -122,14 +903,168 @@ def __(pd):
     load_path_2 = 'data/analysed_layers/'
 
     # Load the DataFrames from the CSV files - the updated version
-    df_100st = pd.read_csv(load_path_2 + 'applying_criterion_100st_rows_v2.csv')
+    df_100st = pd.read_csv(load_path_2 + 'applying_criterion_100st_rows_v6.csv')
     return df_100st, load_path_2
+
+
+@app.cell
+def __(df_100st):
+    df_zero_cracklengths_new = df_100st[df_100st['crack_length'] == 0]
+
+    df_zero_cracklengths_new
+    return df_zero_cracklengths_new,
 
 
 @app.cell
 def __(df_100st):
     # Now we have the copy so that we do not need to rerun everything, and can check the weird cases at once
     df_100st
+
+    # Non-convergent - [12590, 13330, 22890]
+
+    # Half of these fixed with same type of dampened version as for the non-convergence
+    # Zero_crack_length - [22691, 26730, 43772, 43773, 43778, 49770, 56330, 57270
+
+
+    # [22691, 43772, 49770, 57270]
+    # It does seem like 
+
+    return
+
+
+@app.cell
+def __(apply_check_first_criterion, df_100st, plt):
+    # List of profID values to process - We now have convergence on twelve of these
+    # profID_list = [12590, 13330, 13731, 14990, 15952, 20092, 22391, 22890, 43790, 44290, 44331, 44334, 44350, 45771, 46110, 54510, 58010]
+
+    profID_list = [22691, 43772, 49770, 57270]
+    # Dictionary to store data for the final combined plot
+    combined_data = {}
+    convergence_summary = []  # List to store convergence information for each profID
+
+    # Define colors for each profID
+    colors = plt.cm.tab10(range(len(profID_list)))  # Use a colormap to generate unique colors for each profID
+
+    # Loop through each profID and create a separate figure for each
+    for idx, profID_x in enumerate(profID_list):
+        # Filter the DataFrame for the current profID_x
+        df_profID_x = df_100st.loc[df_100st['profID'] == profID_x, ['snow_profiles', 'slopeangle']]
+
+        # Apply the criterion check and expand the result into new columns
+        df_profID_x[[f'convergence_check_{profID_x}', f'skier_weight_{profID_x}', f'crack_length_{profID_x}', f'nbr_iterations_{profID_x}', f'elapsed_times_{profID_x}', f'skier_weights_{profID_x}', f'crack_lengths_{profID_x}']] = df_profID_x.apply(apply_check_first_criterion, axis=1, result_type='expand')
+
+        # Extract the relevant row for plotting
+        row_zero_profID_x = df_profID_x.iloc[0]  # Assuming only one row per profID_x
+
+        # Extract columns for plotting
+        elapsed_times_x = row_zero_profID_x[f'elapsed_times_{profID_x}']
+        skier_weights_x = row_zero_profID_x[f'skier_weights_{profID_x}']
+        crack_lengths_x = row_zero_profID_x[f'crack_lengths_{profID_x}']
+        
+        # Check for convergence and record the result
+        converged = row_zero_profID_x[f'convergence_check_{profID_x}']
+        
+        # Add crack_length and skier_weight to the convergence summary
+        convergence_summary.append(f"profID {profID_x}: {'Converged' if converged else 'Did Not Converge'}, "
+                                   f"Crack Length: {crack_lengths_x[-1]:.2f} mm, Skier Weight: {skier_weights_x[-1]:.2f} kg")
+        
+        # Store data for the combined plot
+        combined_data[profID_x] = (elapsed_times_x, skier_weights_x, crack_lengths_x, colors[idx])
+
+        # Create a new figure specifically for this profID_x
+        fig_profID_x, ax1_profID_x = plt.subplots()
+
+        # Plot elapsed_times_x vs skier_weights_x on the left y-axis with a solid line
+        ax1_profID_x.set_xlabel('Elapsed Time (s)')
+        ax1_profID_x.set_ylabel('Skier Weight (kg)', color='tab:blue')
+        ax1_profID_x.plot(elapsed_times_x, skier_weights_x, color=colors[idx], linestyle='-', label=f'profID {profID_x}')
+        ax1_profID_x.tick_params(axis='y', labelcolor='tab:blue')
+
+        # Create another y-axis to plot crack lengths with unique axis variable, with a dashed line
+        ax2_profID_x = ax1_profID_x.twinx()
+        ax2_profID_x.set_ylabel('Crack Length (mm)', color='tab:red')
+        ax2_profID_x.plot(elapsed_times_x, crack_lengths_x, color=colors[idx], linestyle='--')
+        ax2_profID_x.tick_params(axis='y', labelcolor='tab:red')
+
+        # Add title
+        fig_profID_x.suptitle(f'Converging Loop for profID {profID_x}')
+
+        # Show the plot for this profID_x (it will display each figure separately)
+        plt.show()
+
+    # Create a separate combined plot for all profIDs
+    fig_combined, ax1_combined = plt.subplots()
+
+    # Plot data for each profID_x in the combined plot
+    for profID_x, (elapsed_times_x, skier_weights_x, crack_lengths_x, color) in combined_data.items():
+        # Solid line for skier weight
+        ax1_combined.plot(elapsed_times_x, skier_weights_x, color=color, linestyle='-', label=f'profID {profID_x}')
+
+    # Set properties for the first y-axis (skier weight)
+    ax1_combined.set_xlabel('Elapsed Time (s)')
+    ax1_combined.set_ylabel('Skier Weight (kg)', color='tab:blue')
+    ax1_combined.tick_params(axis='y', labelcolor='tab:blue')
+
+    # Create second y-axis for crack lengths
+    ax2_combined = ax1_combined.twinx()
+    for profID_x, (elapsed_times_x, _, crack_lengths_x, color) in combined_data.items():
+        # Dashed line for crack length
+        ax2_combined.plot(elapsed_times_x, crack_lengths_x, color=color, linestyle='--')
+
+    # Set properties for the second y-axis (crack length)
+    ax2_combined.set_ylabel('Crack Length (mm)', color='tab:red')
+    ax2_combined.tick_params(axis='y', labelcolor='tab:red')
+
+    # Single legend indicating profIDs with unique colors
+    fig_combined.legend(
+        handles=[plt.Line2D([0], [0], color=color, label=f'profID {pid}', linestyle='-') for pid, color in zip(profID_list, colors)],
+        loc='upper left',
+        bbox_to_anchor=(1.05, 1),
+        title="profID (Solid: Weight, Dashed: Crack Length)"
+    )
+
+    fig_combined.suptitle('Converging Loop for All profIDs')
+
+    # Show the combined plot
+    plt.show()
+
+    # Print the convergence summary as plain text
+    print("Convergence Summary for Each profID:")
+    for summary in convergence_summary:
+        print(summary)
+
+    return (
+        ax1_combined,
+        ax1_profID_x,
+        ax2_combined,
+        ax2_profID_x,
+        color,
+        colors,
+        combined_data,
+        converged,
+        convergence_summary,
+        crack_lengths_x,
+        df_profID_x,
+        elapsed_times_x,
+        fig_combined,
+        fig_profID_x,
+        idx,
+        profID_list,
+        profID_x,
+        row_zero_profID_x,
+        skier_weights_x,
+        summary,
+    )
+
+
+@app.cell
+def __():
+    # Four of these still converge to zero crack_length:
+    # [22691, 43772, 49770, 57270]
+
+    # 49770 Weirdly drops below although weight is increasing
+
+    # 22691 Decreases weight and swings back outside the envelope
     return
 
 
@@ -145,6 +1080,64 @@ def __():
 
     # This is where I continue troubleshooting
     return
+
+
+@app.cell
+def __():
+    # Largely the same type of convergence, but slightly
+    return
+
+
+@app.cell
+def __(apply_check_first_criterion, df_100st, plt):
+    # This is a non-convergent over 25 iterations
+
+    # Filter the DataFrame for profID 10198
+    df_10198 = df_100st.loc[df_100st['profID'] == 10198, ['snow_profiles', 'slopeangle']]
+
+    # Apply the criterion check and expand the result into new columns
+    df_10198[['convergence_check', 'skier_weight', 'crack_length', 'nbr_iterations', 'elapsed_times', 'skier_weights', 'crack_lengths']] = df_10198.apply(apply_check_first_criterion, axis=1, result_type='expand')
+
+    # Extract the relevant row for plotting
+    row_zero_10198 = df_10198.iloc[0]  # Since we only have one row for profID 10198
+
+    # Extract columns for plotting
+    elapsed_times_10198 = row_zero_10198['elapsed_times']
+    skier_weights_10198 = row_zero_10198['skier_weights']
+    crack_lengths_10198 = row_zero_10198['crack_lengths']
+
+    # Create a new figure with a unique name
+    fig_10198, ax1_10198 = plt.subplots()
+
+    # Plot elapsed_times vs skier_weights on the left y-axis
+    ax1_10198.set_xlabel('Elapsed Time (s)')
+    ax1_10198.set_ylabel('Skier Weight (kg)', color='tab:blue')
+    ax1_10198.plot(elapsed_times_10198, skier_weights_10198, color='tab:blue', label='Skier Weight')
+    ax1_10198.tick_params(axis='y', labelcolor='tab:blue')
+
+    # Create another y-axis to plot crack lengths with unique axis variable
+    ax2_10198 = ax1_10198.twinx()
+    ax2_10198.set_ylabel('Crack Length (mm)', color='tab:red')
+    ax2_10198.plot(elapsed_times_10198, crack_lengths_10198, color='tab:red', label='Crack Length')
+    ax2_10198.tick_params(axis='y', labelcolor='tab:red')
+
+    # Add titles and legends
+    fig_10198.suptitle(f'Converging Loop for profID {10198}')  # Updated title to reflect convergence
+    ax1_10198.legend(loc='upper left')
+    ax2_10198.legend(loc='upper right')
+
+    # Show the plot
+    plt.show()
+    return (
+        ax1_10198,
+        ax2_10198,
+        crack_lengths_10198,
+        df_10198,
+        elapsed_times_10198,
+        fig_10198,
+        row_zero_10198,
+        skier_weights_10198,
+    )
 
 
 @app.cell
@@ -797,251 +1790,6 @@ def __():
 
 @app.cell
 def __(
-    crack_lengthsiteration_count,
-    create_skier_object_v2,
-    energy_criterion,
-    find_minimum_force_v2,
-    find_new_crack_length_v2,
-    is_outside_stress_envelope,
-    np,
-    time,
-):
-    def check_first_criterion_v2(snow_profile, inclination, skier_weight, envelope='reiweger'):
-        # Assuming nocrack case to begin with and create a skier-object
-        crack_length = 0
-        length = 100 * (sum(layer[1] for layer in snow_profile))  # Total length (mm)
-        # length = 100 * 100 * 10  # Total length (mm) (one hundred meters in mm)
-        # length = 100 * (sum(layer[1] for layer in snow_profile)) 
-        # length = sum(li)
-
-        k0 = [True, True, True, True]  # Support boolean for uncracked solution
-        li = [length / 2, 0, 0, length / 2]  # Support boolean for uncracked solution
-        ki = [True, True, True, True]  # Length of segments with foundations as specified by ki
-
-        skier, C, segments, x_cm, sigma_kPa, tau_kPa = create_skier_object_v2(snow_profile, crack_length, skier_weight, inclination, li, ki, crack_case='nocrack')
-
-        # For the initial skier object, check if we are outside the stress envelope at any point
-        checker, dist_to_failure = is_outside_stress_envelope(sigma_kPa, -tau_kPa, envelope=envelope)
-
-
-        if checker.any() and not checker.all():
-            # Find the weight associated with minimum critical force to initialize our algorithm (BASE CASE)
-            skier_weight, *_ = find_minimum_force_v2(snow_profile, inclination, li, ki, envelope=envelope) 
-
-            # Initialize variables for algorithm
-            init_crack_length = 1  # Initial crack length
-            err = 1000  # Error margin
-            li = [length / 2 - init_crack_length / 2, init_crack_length / 2, init_crack_length / 2, length / 2 - init_crack_length / 2]
-            ki = [True, False, False, True]
-
-            # Initialize iteration variables
-            iteration_count = 0
-            max_iterations = 25
-
-            # Time tracker
-            start_time = time.time()
-            elapsed_times = []
-
-            # Tracker lists for skier weights and crack lengths
-            skier_weights = []
-            crack_lengths = []
-
-
-            while np.abs(err) > 0.002 and iteration_count < max_iterations and any(ki):
-                # ki.any() ensures we move out in case we are outside the envelope in all points
-
-                # Increment iteration counter
-                iteration_count += 1
-
-
-                # Track skier weight and crack length for each iteration
-                skier_weights.append(skier_weight)
-                crack_lengths.append(crack_length)
-
-                # Time tracking for each iteration
-                elapsed_times.append(time.time() - start_time)
-
-
-
-                # Create the base_case with correct number of segments
-                skier, C, segments, x_cm, sigma_kPa, tau_kPa = create_skier_object_v2(snow_profile, crack_length, skier_weight, inclination, li, ki, crack_case='nocrack')
-
-                # Solving a cracked solution
-                c_skier, c_C, c_segments, c_x_cm, c_sigma_kPa, c_tau_kPa = create_skier_object_v2(snow_profile, crack_length, skier_weight, inclination, li, ki, crack_case='crack')
-
-                # print(f" Solution: {c_segments}")
-
-                # Section to keep track of distance to failure
-                checker_2, dist_to_failure_2 = is_outside_stress_envelope(sigma_kPa, -tau_kPa, envelope=envelope)
-                # WHY IS THIS NOT THE SAME DISTANCE TO FAILURE AS THE LAST ONE IN find_min_force
-
-                print(f" START OF ITERATION {iteration_count}: cracklength: {crack_length} mm, Skier Weight: {skier_weight} kg, Max Distance to Failure: {np.max(dist_to_failure_2)}")
-
-
-                # The uncracked solution will have True for all values
-                k0 = np.full(len(ki), True)
-
-                # Calculate incremental energy released compared to (BASE CASE) solution above
-                incr_energy = c_skier.ginc(C0=C, C1=c_C, phi=inclination, **c_segments, k0=k0)
-
-                # Evaluate energy envelope (scaling by 1000 to convert kJ to J)
-                g_delta = energy_criterion(1000 * incr_energy[1], 1000 * incr_energy[2])
-
-                # For any g_delta below 1, we are not outside the energy envelope and must increase the force
-                current_normal_force, current_tangential_force = c_skier.get_skier_load(skier_weight, inclination)
-                current_gravitational_force = np.sqrt(current_normal_force ** 2 + current_tangential_force ** 2)
-                updated_gravitational_force = (g_delta**(-1/12)) * (current_gravitational_force)
-
-                scaling = (g_delta**(-1/12))
-
-                # Updating error margin
-                err = np.abs(updated_gravitational_force - current_gravitational_force) / updated_gravitational_force
-
-                # For errors > margin we scale skier weight according to g_delta calculated above, and find new crack length
-                if np.abs(err) > 0.002:
-                    new_skier_weight = skier_weight * scaling
-
-
-                    # For the updated skier force, we find all points where the weak layer is overloaded and use this as 
-                    # the crack length in the next iteration (with li and ki specifying how the crack is positioned in the weak layer)
-                    new_crack_length, li, ki = find_new_crack_length_v2(snow_profile, skier_weight, inclination, li, ki, envelope=envelope)
-                    crack_length = new_crack_length
-                    print(f" END OF ITERATION: g_delta: {g_delta} J/m^2, Old skier weight: {skier_weight} kg, Scaling: {scaling} kg, New skier weight: {new_skier_weight} kg, cracklength: {crack_length} mm,")
-
-                    skier_weight = new_skier_weight
-                    #while new_crack_length==0:
-                        # We have now scaled ourselves out of the envelope, which is a mistake most often caused by the switch from multiple crack openings to a singular one.
-                        # We would ideally like to be somewhere between our two last entries, before this one that is obviously too low
-
-            # End of loop, i.e., convergence or max iteration reached
-            if iteration_count < max_iterations and any(ki):
-                print(f" CONVERGENCE: cracklength: {crack_length} mm, Critical Skier Weight: {skier_weight} kg, Distance to energy envelope: {g_delta} J/m^2, Max Distance to Stress Envelope: {np.max(dist_to_failure_2)}")
-                return True, crack_length, skier_weight, c_skier, c_C, c_segments, c_x_cm, c_sigma_kPa, c_tau_kPa, iteration_count, elapsed_times, skier_weights, crack_lengths
-            elif not any(ki):
-                print("We are outside the envelope in all points")
-                return True, crack_length, skier_weight, None, None, None, None, None, None, 0, iteration_count, elapsed_times, skier_weights, crack_lengthsiteration_count
-            else:
-                print("Maximum iterations reached without convergence.")
-                return False, crack_length, skier_weight, None, None, None, None, None, None, 0, elapsed_times, skier_weights, crack_lengths
-
-        elif checker.all():
-            # Extreme case (i) we are outside the boundary at all points
-            crack_length = length
-            skier_weight = 1
-
-            return False, crack_length, skier_weight, None, None, None, None, None, None, 0, elapsed_times, skier_weights, crack_lengths
-
-        else:
-            # Extreme case (ii) We do not fulfill the stress criterion in any point, and will therefore not be able to trigger an avalanche
-            return False, 0, skier_weight, None, None, None, None, None, None, 0, elapsed_times, skier_weights, crack_lengths
-    return check_first_criterion_v2,
-
-
-@app.cell
-def __(create_skier_object_v2, is_outside_stress_envelope, np):
-    def find_new_crack_length_v2(snow_profile, skier_weight_z, inclination, li, ki, envelope='reiweger'):
-
-        crack_length = 0
-
-        print("INSIDE FIND NEW CRACK LENGTH METHOD")
-        skier, C, segments, x_cm, sigma_kPa, tau_kPa = create_skier_object_v2(
-            snow_profile, crack_length, skier_weight_z, inclination, li, ki, crack_case='nocrack') 
-
-        # Check if we are outside the stress envelope
-
-        #
-        checker, dist_to_failure = is_outside_stress_envelope(sigma_kPa, -tau_kPa, envelope=envelope) 
-
-        # Flattening arrays
-        x_cm_array = np.array(10*x_cm).flatten()
-        dist_to_fail_array = np.array(dist_to_failure).flatten()
-        checker_array = np.array(checker).flatten()
-
-        print("Distance to Failure Array:", dist_to_fail_array)
-        #print("X cm Array:", x_cm_array)
-
-        # Create a foundation object
-        foundations = ~checker_array
-
-        # Finding switch indices
-        switches = np.where(np.diff(np.sign(dist_to_fail_array - 0.999)))[0]
-        print("Switches Indices:", switches, x_cm[switches+1], dist_to_fail_array[switches+1])
-
-        # Ensure switches + 1 are within bounds
-        if switches.size > 0:
-
-            ki = [foundations[0]]
-            ki.extend(foundations[switches + 1])
-
-            ## SHOULD IT REALLY BE PLUS ONE? 
-
-            #print("Foundation States at Switches:", ki)
-
-            # Constructing segment boundaries
-            segment_boundaries = [x_cm_array[0]]  # Start with the first point
-            segment_boundaries.extend(x_cm_array[switches+1])  # Append the points where switches occur
-            segment_boundaries.append(x_cm_array[-1])  # End with the last point
-
-            #print("Segment Boundaries:", segment_boundaries)
-
-            # Calculate lengths between segment boundaries
-            li = np.diff(segment_boundaries)
-
-            # print("Lengths between segment boundaries (li):", li)
-
-            # Calculate total length of li
-            total_length = np.sum(li)
-            midpoint = total_length / 2
-            #print("Total Length of li:", total_length)
-            #print("Midpoint of Total Length:", midpoint)
-
-            # Locate the segment that brings the cumulative sum to the midpoint
-            cumulative_length = np.cumsum(li)
-            #print("Cumulative Lengths of li:", cumulative_length)
-
-            # Find the index of the segment containing the midpoint
-            segment_index = np.where(cumulative_length >= midpoint)[0][0]  # First segment to exceed midpoint
-            #print("Segment Index at Midpoint:", segment_index)
-
-            # If the segment index is valid, split that segment
-            if segment_index < len(li):
-                segment_start = cumulative_length[segment_index - 1] if segment_index > 0 else 0
-                segment_to_split_length = li[segment_index]
-
-                # Calculate the length to split
-                split_length = midpoint - segment_start
-
-                # Adjust the lengths
-                li = np.insert(li, segment_index, [split_length, segment_to_split_length - split_length])
-                li = np.delete(li, segment_index + 2)  # Remove the original segment that was split
-
-                # Split the ki array accordingly
-                # Duplicate the foundation state of the original segment
-                ki = np.insert(ki, segment_index, ki[segment_index])  # Insert the existing boolean value twice
-                print("New ki after splitting:", ki)
-
-                print("New Lengths after Splitting Segment:", li)
-
-        else:
-            ki = [foundations[0],foundations[0], foundations[-1], foundations[-1]]  # If there are no switches, we are on the same side of the envelope in all points
-
-            # This should mean that we are outside the envelope in all places
-            total_length = np.sum(li)
-            midpoint = total_length / 2
-
-            li = [total_length/2,0,0, total_length/2] # We just make sure to split the segment in half
-
-
-
-        # Calculate new crack length
-        new_crack_length = sum(length for length, foundation in zip(li, ki) if not foundation)
-
-        return new_crack_length, li, ki
-    return find_new_crack_length_v2,
-
-
-@app.cell
-def __(
     create_skier_object,
     create_skier_object_v2,
     is_outside_stress_envelope,
@@ -1079,36 +1827,6 @@ def __(
         # Once the loop exits, it means we have found the critical skier weight
         return skier_weight, skier, C, segments, x_cm, sigma_kPa, tau_kPa, dist_to_failure
     return find_minimum_force_v2,
-
-
-@app.cell
-def __(ast, check_first_criterion_v2):
-    # Function to apply for extracting skier_weight and crack_length
-    def apply_check_first_criterion(row):
-
-        inclination = row['slopeangle']
-        # skier_weight = row['approximate_critical_loads']
-        snow_profile = ast.literal_eval(row['snow_profiles'])
-
-        # REMEMBER THAT WE NEED TO REVERSE
-
-        print(snow_profile)
-
-        snow_profile_reversed = snow_profile[::-1]
-
-        print(snow_profile_reversed)
-
-        convergence_check, crack_length, skier_weight, _, _, _, _, _, _, iterations, elapsed_times, skier_weights, crack_lengths = check_first_criterion_v2(
-            snow_profile=snow_profile_reversed, inclination=inclination, skier_weight=1000, envelope='no_cap'
-        )
-
-        if convergence_check:
-            print(f"\033[91m CONVERGENCE: WE FOUND A SOLUTION AND WILL NOW LOOK AT THE NEXT DATA POINT \033[0m")
-        else:
-            print(f"\033[91m ALGORITHM DID NOT CONVERGE \033[0m")
-
-        return convergence_check, skier_weight, crack_length, iterations, elapsed_times, skier_weights, crack_lengths
-    return apply_check_first_criterion,
 
 
 @app.cell
@@ -1322,6 +2040,16 @@ def __(delta, inclination, np, skier):
 
     print(new_force)
     return forces, new_force
+
+
+@app.cell
+def __(c_C, c_skier, inclination, ki, li, np):
+    #### Fetching the exact tau and sigma
+    length_summed = np.sum(li)
+    x_continuous = np.linspace(0,length_summed,1000)
+
+    solution_vector = c_skier.z(x_continuous,c_C,li,inclination,ki)
+    return length_summed, solution_vector, x_continuous
 
 
 @app.cell
